@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Week 5 - GSoC 2026 Blog</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" />
+</head>
+
+<body class="bg-white text-gray-800 font-sans">
+
+  <!-- Header -->
+  <section class="bg-gradient-to-r from-gray-700 to-gray-900 text-white text-center py-12">
+    <h2 class="text-3xl md:text-4xl font-extrabold tracking-widest">Compiling Benchmark.f and feq-parse with LFortran
+    </h2>
+    <p class="mt-2 text-lg font-medium">GSoC 2026 @Fortran-lang</p>
+    <p class="mt-1 text-sm text-gray-300">by Jatin Agarwal</p>
+  </section>
+
+  <!-- Blog Content -->
+  <section class="px-6 py-10 max-w-4xl mx-auto">
+
+    <h1 class="text-2xl md:text-3xl font-bold mb-1">Week 5 - Fixing Procedure Pointer Regressions</h1>
+    <p class="text-sm text-gray-500 mb-6">June 13 – June 19, 2026</p>
+
+    <p class="mb-4 leading-relaxed">
+      This week was heavily focused on pushing past two major compilation milestones in <code>benchmark.f</code>. I
+      tackled both the 86% and 91% blockers, which required deep dives into the compiler's LLVM code generation and ASR
+      (Abstract Semantic Representation) type synchronization logic. Here is a breakdown of the two major Pull Requests
+      that resolved these issues: <strong>PR #11806</strong> and <strong>PR #11874</strong>.
+    </p>
+
+    <!-- ===== PR #11806 ===== -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">PR #11806: Resolving LLVM IR Verification Failures</h3>
+
+    <p class="mb-2 leading-relaxed">
+      At the 86% compilation mark, the compiler was crashing with LLVM IR verification failures. <a
+        href="https://github.com/lfortran/lfortran/pull/11806" target="_blank" class="text-blue-600 hover:underline">PR
+        #11806</a> tackled two distinct issues that were causing these crashes:
+    </p>
+
+    <ul class="list-disc pl-6 mb-4 space-y-2 leading-relaxed">
+      <li>
+        <strong>Intrinsic Type Mismatches:</strong> We encountered an issue where the <code>date_and_time</code>
+        intrinsic was generating invalid LLVM IR. The fix involved correcting descriptor-based array type initialization
+        and ensuring that variable kinds were properly cast (e.g., adding strict <code>cast_kind</code> rules) before
+        being passed to the backend.
+      </li>
+      <li>
+        <strong>Procedure Pointer Signatures:</strong> The second part of the fix addressed a compiler crash that
+        happened when passing a specific function to a generic procedure argument (like <code>procedure() :: f</code>).
+        The backend strictly rejected the call because the signature of the function we were passing didn't exactly
+        match the generic, empty signature expected by the procedure argument.
+        <br><br>
+        Initially, I tried to force these types to match by simply casting (bitcasting) them directly during the LLVM
+        code generation phase. However, after discussions with Saurabh and Ondřej, we realized this wasn't the
+        correct approach. The compiler's abstract representation (ASR) needed to understand and validate these types
+        first, rather than just forcing them to fit at the very end.
+        <br><br>
+        To find the best path forward, we analyzed how other major compilers like <strong>GFortran</strong> and
+        <strong>Flang</strong> handle this kind of runtime polymorphism. Flang uses modern "opaque" pointers, while
+        GFortran performs a cast at the call site. Since LFortran uses explicitly typed pointers, a cast at the call
+        site was unavoidable, but we needed to make it safe and predictable.
+        <br><br>
+        Instead of blindly casting whenever types didn't match, I updated the compiler to check the ASR first. If it
+        sees that a parameter is specifically designed to be a generic procedure interface, it now safely casts the
+        incoming function to a generic pointer type (like <code>void ()*</code>) right at the call site. This perfectly
+        aligned our implementation with standard compiler behaviors while ensuring the compiler strictly understands
+        what it's doing!
+      </li>
+    </ul>
+
+    <!-- ===== PR #11874 ===== -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">PR #11874: The 91% Blocker & Implicit Interface Sync</h3>
+
+    <p class="mb-2 leading-relaxed">
+      With the 86% blocker resolved, compilation progressed to 91% before hitting a severe ASR verify pass error:
+    </p>
+
+    <pre
+      class="bg-gray-100 border-l-4 border-red-500 rounded p-4 overflow-x-auto text-sm text-red-600 mb-4 font-mono">ASR verify pass error: Number of argument types in FunctionType must be exactly same as number of arguments in the function</pre>
+
+    <p class="mb-4 leading-relaxed">
+      This was tracked in Issue #11873. The root cause was that when compiling procedure pointers acting as dummy
+      arguments with implicit interfaces (e.g., <code>procedure(), nopass, pointer :: caller =&gt; null()</code>), the
+      ASR verifier and LLVM backend were failing to keep the function signatures synchronized with the actual arguments.
+    </p>
+
+    <p class="mb-4 leading-relaxed">
+      To fix this, I submitted <a href="https://github.com/lfortran/lfortran/pull/11874" target="_blank"
+        class="text-blue-600 hover:underline">PR #11874</a>, which required several coordinated changes during the
+      compiler's semantic analysis phase.
+    </p>
+
+    <p class="mb-4 leading-relaxed">
+      First, we noticed that different parts of the code were creating separate copies of the same function signature in
+      memory. When one part updated the signature, the others didn't see the change. I modified the code to strictly
+      reuse the exact same memory object for these interfaces. This stopped the "type divergence," ensuring that any
+      update was instantly seen by all variables sharing that interface.
+    </p>
+
+    <p class="mb-4 leading-relaxed">
+      Next, to satisfy the compiler's internal verifier, I added logic to explicitly create internal dummy variables for
+      these interfaces so that the number of arguments perfectly matched the expected list of argument types.
+    </p>
+
+    <p class="mb-4 leading-relaxed">
+      The most crucial architectural fix was adding a new synchronization sweep at the very end of the semantic
+      analysis. This loop specifically targets auto-generated interfaces and synchronizes the types of their internal
+      dummy variables with their fully resolved argument types. To ensure we didn't accidentally break standard
+      user-defined interfaces, I added a strict filter based on internal naming conventions.
+    </p>
+
+    <p class="mb-4 leading-relaxed">
+      Finally, I made sure that whenever a procedure variable's arguments are successfully resolved inside a function
+      call, that updated type information is actively propagated back up to the parent function. This keeps everything
+      perfectly in sync from top to bottom!
+    </p>
+
+    <!-- ===== Progress ===== -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Progress & Next Steps</h3>
+
+    <p class="mb-4 leading-relaxed">
+      We've made massive strides this week in overcoming these two compilation hurdles, but there is still some
+      remaining work to finalize them:
+    </p>
+    <ul class="list-disc pl-6 mb-4 space-y-2 leading-relaxed">
+      <li>
+        <strong>For PR #11806:</strong> Only a few minor things remain. Specifically, we need to add <code>#ifdef</code>
+        guards to correctly query the LLVM version and ensure compatibility across different LLVM releases.
+      </li>
+      <li>
+        <strong>For PR #11874:</strong> I will be iterating on the current fix and refining the synchronization approach
+        with Assem in the coming days.
+      </li>
+    </ul>
+    <p class="mb-4 leading-relaxed">
+      Once these final touches are completely wrapped up, we will finally move forward past the 91% compilation mark and
+      see what the next error in <code>benchmark.f</code> holds for us!
+    </p>
+
+    <p class="mb-8 mt-6 leading-relaxed bg-blue-50 border-l-4 border-blue-500 p-4 text-blue-800 rounded">
+      <strong>Time Log:</strong> I worked around 33 hours this week, diving deep into runtime polymorphism across different compilers, implementing ASR-driven type checking, and resolving complex LLVM signature mismatches for procedure pointers.
+    </p>
+
+    <!-- ===== Acknowledgments ===== -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Acknowledgments</h3>
+    <p class="mb-4 leading-relaxed">
+      I would like to thank <a href="https://github.com/kmr-srbh" target="_blank"
+        class="text-blue-600 hover:underline">Saurabh Kumar</a>, <a href="https://github.com/assem2002" target="_blank"
+        class="text-blue-600 hover:underline">Assem Medhat</a> and <a href="https://github.com/HarshitaKalani"
+        target="_blank" class="text-blue-600 hover:underline">Harshita
+        Kalani</a> for the detailed code reviews, as well as <a href="https://github.com/certik" target="_blank"
+        class="text-blue-600 hover:underline">Ondřej Čertík</a> for his guidance and continuous support on the project.
+    </p>
+
+  </section>
+
+  <!-- Navigation -->
+  <section class="px-6 max-w-4xl mx-auto flex justify-between py-6 border-t">
+    <a href="week4.html" class="text-blue-600 hover:underline font-medium">← Previous Week</a>
+    <a href="gsoc26.html" class="text-blue-600 hover:underline font-medium">Blog Home</a>
+    <!-- <a href="week6.html" class="text-blue-600 hover:underline font-medium">Next Week →</a> -->
+  </section>
+
+  <!-- Footer -->
+  <footer class="bg-gray-100 text-center py-8 text-sm text-gray-600">
+    <div class="flex justify-center space-x-6 mb-2 text-gray-700 text-xl">
+      <a href="https://github.com/Jatinagarwal24" target="_blank"><i class="fab fa-github hover:text-gray-900"></i></a>
+      <a href="mailto:23110147@iitgn.ac.in"><i class="fas fa-envelope hover:text-gray-900"></i></a>
+    </div>
+    <p>Thanks for reading and for following along this summer. ❤️</p>
+  </footer>
+
+</body>
+
+</html>
