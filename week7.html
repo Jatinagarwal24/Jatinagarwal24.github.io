@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Week 7 - GSoC 2026 Blog</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" />
+</head>
+
+<body class="bg-white text-gray-800 font-sans">
+
+  <!-- Header -->
+  <section class="bg-gradient-to-r from-gray-700 to-gray-900 text-white text-center py-12">
+    <h2 class="text-3xl md:text-4xl font-extrabold tracking-widest">Compiling Benchmark.f and feq-parse with LFortran
+    </h2>
+    <p class="mt-2 text-lg font-medium">GSoC 2026 @Fortran-lang</p>
+    <p class="mt-1 text-sm text-gray-300">by Jatin Agarwal</p>
+  </section>
+
+  <!-- Blog Content -->
+  <section class="px-6 py-10 max-w-4xl mx-auto">
+
+    <h1 class="text-2xl md:text-3xl font-bold mb-1">Week 7 - Resolving Internal Compiler Errors and Deserialization
+      Issues</h1>
+    <p class="text-sm text-gray-500 mb-6">June 27 – July 3, 2026</p>
+
+    <p class="mb-4 leading-relaxed">
+      This week, I focused heavily on resolving complex Internal Compiler Errors (ICEs) that popped up while compiling
+      <code>benchmark.f</code>, specifically dealing with ASR symbol table scopes and module deserialization bugs related
+      to procedure pointers and intrinsic wrappers.
+    </p>
+
+    <!-- ===== New Issues ===== -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Fixing ASR Symbol Table and Deserialization Bugs</h3>
+
+    <p class="mb-4 leading-relaxed">
+      In my continuous effort to achieve full compilation of <code>benchmark.f</code>, I discovered and resolved two
+      tricky bugs regarding how LFortran handles scopes for intrinsic function wrappers and module serialization.
+    </p>
+
+    <!-- Issue 12043 -->
+    <h4 class="text-lg font-medium mt-6 mb-2">1. ASR Verify Fails for Intrinsic Wrappers in Nested Blocks (<a
+        href="https://github.com/lfortran/lfortran/issues/12043" target="_blank"
+        class="text-blue-600 hover:underline">Issue #12043</a> / <a
+        href="https://github.com/lfortran/lfortran/pull/12044" target="_blank" class="text-blue-600 hover:underline">PR
+        #12044</a>)</h4>
+    <p class="mb-2 leading-relaxed">
+      <strong>The Problem:</strong> I encountered an Internal Compiler Error when calling `get_environment_variable`
+      with a string slicing expression from within a nested scope, like a <code>block</code> construct. The ASR verifier
+      threw a scoping error:
+      <code
+        class="bg-gray-100 text-red-600 px-1 py-0.5 rounded mt-1 inline-block">Var::m_v 'ilen' cannot point outside of its symbol table</code>
+      This happened because the compiler generates a synthetic wrapper subroutine for the intrinsic function and hoists
+      it to the global scope. However, it mistakenly captured the explicit length dimension containing the local
+      variable <code>ilen</code>, causing an out-of-scope reference!
+    </p>
+    <p class="mb-2 font-semibold">Minimal Reproducible Example (MRE):</p>
+    <pre class="bg-gray-100 p-4 rounded-md overflow-x-auto text-sm font-mono mt-2 mb-4"><code>program p
+  implicit none
+  integer :: ilen
+  character(10) :: ctmp
+  character(10) :: str = "hello"
+  ilen = 5
+  block
+    call get_environment_variable(str(:ilen), ctmp)
+  end block
+end program p</code></pre>
+    <p class="mb-4 leading-relaxed">
+      <strong>The Solution:</strong> To fix this scoping bug, I updated the synthetic wrapper generation logic.
+      Specifically, in <code>intrinsic_subroutines.h</code> for <code>instantiate_GetEnvironmentVariable</code>, I
+      forced the string arguments (<code>name</code> and <code>value</code>) passed to the wrapper to use an
+      <code>AssumedLength</code> character type. By doing this, the wrapper no longer captures the local variable
+      defining the explicit string length. I isolated this change to avoid altering other arguments (like explicit-shape
+      arrays), ensuring LLVM codegen signatures remained perfectly intact.
+    </p>
+
+    <!-- Issue 12045 -->
+    <h4 class="text-lg font-medium mt-6 mb-2">2. Deserialization Failure for Implicit Interface Procedure Pointers (<a
+        href="https://github.com/lfortran/lfortran/issues/12045" target="_blank"
+        class="text-blue-600 hover:underline">Issue #12045</a> / <a
+        href="https://github.com/lfortran/lfortran/pull/12046" target="_blank" class="text-blue-600 hover:underline">PR
+        #12046</a>)</h4>
+    <p class="mb-2 leading-relaxed">
+      <strong>The Problem:</strong> Another severe ICE occurred during module deserialization. When importing a module
+      containing a derived type with a procedure pointer (which lacked an explicit interface) into another module, and
+      then utilizing it in the main program, the compiler crashed with:
+      <code
+        class="bg-gray-100 text-red-600 px-1 py-0.5 rounded mt-1 inline-block">Deserialization failed: symbol '__caller_iface_implicit' references symbol table with ID 2 which has not been deserialized yet.</code>
+    </p>
+    <p class="mb-2 font-semibold">Minimal Reproducible Example (MRE):</p>
+    <pre class="bg-gray-100 p-4 rounded-md overflow-x-auto text-sm font-mono mt-2 mb-4"><code>module mod_a
+  implicit none
+  type :: type_a
+    procedure(), nopass, pointer :: caller => null()
+  end type
+end module
+
+module mod_b
+  use mod_a
+  implicit none
+  type :: type_b
+    procedure(), nopass, pointer :: caller => null()
+  end type
+end module
+
+program p
+  use mod_b
+  implicit none
+  type(type_b) :: x
+end program</code></pre>
+    <p class="mb-4 leading-relaxed">
+      <strong>The Solution:</strong> The crash was caused by the synthetic <code>__caller_iface_implicit</code>
+      interface (generated by the compiler to represent the implicit interface) leaking into the module's public
+      Application Binary Interface (ABI). During deserialization, this caused an out-of-order symbol table reference
+      because the compiler tried to resolve internal metadata that shouldn't have been exported. I resolved this by
+      correctly marking the synthetic interface as <code>Private</code> (<code>ASR::accessType::Private</code>) in
+      <code>ast_common_visitor.h</code>. Now, the compiler properly treats it purely as internal ASR type-checking
+      metadata, preventing the critical deserialization failure!
+    </p>
+
+
+    <!-- ===== Progress ===== -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Progress & Next Steps</h3>
+
+    <p class="mb-4 leading-relaxed">
+      With these complex symbol table and serialization bugs out of the way, LFortran is becoming significantly more
+      robust in handling nested scopes and complex module dependencies. <strong>Most importantly, once these two PRs get
+        merged into the main branch, we will successfully be compiling 92% of the <code>benchmark.f</code>
+        package!</strong> My next steps involve continuing the push to reach 100% compilation and running the complete
+      test suite to uncover any further edge cases.
+    </p>
+
+    <p class="mb-8 mt-6 leading-relaxed bg-blue-50 border-l-4 border-blue-500 p-4 text-blue-800 rounded">
+      <strong>Time Log:</strong> I worked around 28 hours this week, diving deep into the ASR serialization processes
+      and intrinsic wrapper instantiations to fix scoping and ABI leakage bugs.
+    </p>
+
+    <!-- ===== Acknowledgments ===== -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Acknowledgments</h3>
+    <p class="mb-4 leading-relaxed">
+      I would like to thank <a href="https://github.com/kmr-srbh" target="_blank"
+        class="text-blue-600 hover:underline">Saurabh Kumar</a>, <a href="https://github.com/assem2002" target="_blank"
+        class="text-blue-600 hover:underline">Assem Medhat</a> and <a href="https://github.com/HarshitaKalani"
+        target="_blank" class="text-blue-600 hover:underline">Harshita
+        Kalani</a> for the detailed code reviews, as well as <a href="https://github.com/certik" target="_blank"
+        class="text-blue-600 hover:underline">Ondřej Čertík</a> for his guidance and continuous support on the project.
+    </p>
+
+  </section>
+
+  <!-- Navigation -->
+  <section class="px-6 max-w-4xl mx-auto flex justify-between py-6 border-t">
+    <a href="week6.html" class="text-blue-600 hover:underline font-medium">← Previous Week</a>
+    <a href="gsoc26.html" class="text-blue-600 hover:underline font-medium">Blog Home</a>
+  </section>
+
+  <!-- Footer -->
+  <footer class="bg-gray-100 text-center py-8 text-sm text-gray-600">
+    <div class="flex justify-center space-x-6 mb-2 text-gray-700 text-xl">
+      <a href="https://github.com/Jatinagarwal24" target="_blank"><i class="fab fa-github hover:text-gray-900"></i></a>
+      <a href="mailto:23110147@iitgn.ac.in"><i class="fas fa-envelope hover:text-gray-900"></i></a>
+    </div>
+    <p>Thanks for reading and for following along this summer. ❤️</p>
+  </footer>
+
+</body>
+
+</html>
