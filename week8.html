@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Week 8 - GSoC 2026 Blog</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" />
+</head>
+
+<body class="bg-white text-gray-800 font-sans">
+
+  <!-- Header -->
+  <section class="bg-gradient-to-r from-gray-700 to-gray-900 text-white text-center py-12">
+    <h2 class="text-3xl md:text-4xl font-extrabold tracking-widest">Compiling Benchmark.f and feq-parse with LFortran
+    </h2>
+    <p class="mt-2 text-lg font-medium">GSoC 2026 @Fortran-lang</p>
+    <p class="mt-1 text-sm text-gray-300">by Jatin Agarwal</p>
+  </section>
+
+  <!-- Blog Content -->
+  <section class="px-6 py-10 max-w-4xl mx-auto">
+
+    <h1 class="text-2xl md:text-3xl font-bold mb-1">Week 8 - Fixing Procedure Pointers, ASR Verify Errors, and Multiple
+      Definition Linker Issues</h1>
+    <p class="text-sm text-gray-500 mb-6">July 4 – July 10, 2026</p>
+
+    <p class="mb-4 leading-relaxed">
+      This week, we focused heavily on resolving complex ASR verification failures related to struct symbols, fixing
+      LLVM procedure pointer bitcasting issues, and ironing out multiple definition errors occurring during the separate
+      compilation of Fortran files.
+    </p>
+
+    <!-- PR 11975 -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Resolving ASR Verify Error for StructType in Implicit Interface Dummy
+      Args (<a href="https://github.com/lfortran/lfortran/pull/11975" target="_blank"
+        class="text-blue-600 hover:underline">PR #11975</a>)</h3>
+
+    <p class="mb-4 leading-relaxed">
+      <strong>The Problem:</strong> When generating dummy arguments for implicit procedure interfaces, variables that
+      had a <code>StructType</code> (like <code>class(*)</code>) were being created without their underlying struct
+      symbol (passing <code>nullptr</code> instead). This missing information caused ASR verification failures. My
+      initial attempt tried to fetch a random struct symbol to satisfy the verifier, but since <code>StructType</code>
+      doesn't hold the exact symbol information, that approach was flawed.
+    </p>
+    <p class="mb-4 leading-relaxed">
+      <strong>The Solution:</strong> I realized that guessing the struct symbol wasn't the right approach. Instead, I
+      updated the code to explicitly pass the exact <code>type_declaration</code> symbol directly into the interface
+      creation function from wherever it's called. If a symbol isn't available, I just pass <code>nullptr</code>. This
+      ensures the interface always gets the correct type information. I also fixed a syncing issue by simply skipping
+      the sync step whenever we deal with a <code>StructType</code>. These changes cleanly resolved the ASR verifier
+      errors! I also took some time this week to address the reviewer comments on my previous <a
+        href="https://github.com/lfortran/lfortran/pull/11805" target="_blank" class="text-blue-600 hover:underline">PR
+        #11805</a>.
+    </p>
+
+    <!-- PR 12110 -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Fixing Procedure Pointer Verification Failure by Bitcasting Fixed-Size
+      Arrays (<a href="https://github.com/lfortran/lfortran/pull/12110" target="_blank"
+        class="text-blue-600 hover:underline">PR #12110</a>)</h3>
+
+    <p class="mb-2 leading-relaxed">
+      <strong>The Problem:</strong> I ran into an LLVM verification failure when passing fixed-size arrays to a
+      procedure pointer:
+      <code
+        class="bg-gray-100 text-red-600 px-1 py-0.5 rounded mt-1 mb-2 inline-block">Call parameter type does not match function signature</code><br>
+      In older versions of LLVM (before LLVM 15), pointers have strict types. A procedure pointer might expect a simple
+      generic pointer like <code>double*</code>, but we were passing it a fixed-size array pointer like
+      <code>[100 x double]*</code>. This strict type mismatch caused the backend verifier to fail.
+    </p>
+
+    <p class="mb-2 font-semibold">Minimal Reproducible Example (MRE):</p>
+    <pre class="bg-gray-100 p-4 rounded-md overflow-x-auto text-sm font-mono mt-2 mb-4"><code>program test_proc_ptr
+  implicit none
+  abstract interface
+      subroutine proc_iface(a)
+          real(8), intent(inout) :: a(100)
+      end subroutine
+  end interface
+  procedure(proc_iface), pointer :: pp
+  real(8) :: x(100)
+  
+  call pp(x) 
+end program</code></pre>
+
+    <p class="mb-4 leading-relaxed">
+      <strong>The Solution:</strong> To satisfy the strict LLVM verifier, I added a conditional check that inserts an
+      explicit bitcast (<code>CreateBitCast</code>) right before the indirect procedure call. This bitcast converts the
+      fixed-size array argument into the generic pointer type that the function signature actually expects. Since this
+      is only an issue with older typed pointers, I made sure this code is only compiled for LLVM versions older than
+      15. For LLVM 15 and above, which use opaque pointers, this bitcast is safely ignored.
+    </p>
+
+    <!-- PR 12174 -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Resolving Multiple Definition Linker Errors for Compiler-Generated
+      Helpers (<a href="https://github.com/lfortran/lfortran/pull/12174" target="_blank"
+        class="text-blue-600 hover:underline">PR #12174</a>)</h3>
+
+    <p class="mb-2 leading-relaxed">
+      <strong>The Problem:</strong> When trying to link multiple compiled Fortran files together, I started seeing
+      severe linker errors:
+      <code
+        class="bg-gray-100 text-red-600 px-1 py-0.5 rounded mt-1 mb-2 inline-block">multiple definition of `_lcompiler_...`</code><br>
+      This happened because LFortran generates special helper functions (like
+      <code>_lcompiler_optimization_exponent_f64</code>) for intrinsics. These helpers were being fully generated and
+      exported in <em>every</em> single file that used them, causing the linker to complain about duplicate definitions.
+    </p>
+
+    <p class="mb-2 font-semibold">Minimal Reproducible Example (MRE):</p>
+    <pre class="bg-gray-100 p-4 rounded-md overflow-x-auto text-sm font-mono mt-2 mb-4"><code>! file1.f90
+module mod1
+contains
+  subroutine test1(x)
+    real(8) :: x
+    print *, exponent(x)
+  end subroutine
+end module
+
+! file2.f90
+module mod2
+contains
+  subroutine test2(x)
+    real(8) :: x
+    print *, exponent(x)
+  end subroutine
+end module
+
+! main.f90
+program main
+  use mod1
+  use mod2
+  call test1(2.0_8)
+  call test2(3.0_8)
+end program</code></pre>
+
+    <p class="mb-4 leading-relaxed">
+      <strong>The Solution:</strong> I figured out that we could tell the linker these helper functions are identical
+      across all files. I solved this by setting the linkage type to <code>LinkOnceODRLinkage</code> for any function
+      starting with <code>_lcompiler_</code>. This instructs the linker to safely throw away the duplicate definitions
+      and keep just one single copy for the final executable. This completely eliminated the multiple definition errors!
+    </p>
+
+    <!-- ===== Progress & Next Steps ===== -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Progress & Next Steps</h3>
+    <p class="mb-4 leading-relaxed">
+      I'm thrilled to share that once all the PRs mentioned above, along with an additional PR I plan to open soon, are
+      merged, <strong>we will be able to successfully build 100% of the <code>benchmark.f</code> repository with
+        LFortran!</strong> Here is the local terminal output confirming this massive milestone:
+    </p>
+
+    <pre class="bg-gray-100 text-gray-800 p-4 rounded-md overflow-x-auto text-xs sm:text-sm font-mono mt-2 mb-6"><code>(lf) root@LAPTOP-8SLTQKJO:~/benchmark.f# fpm build --compiler=lfortran --flag "--cpp --realloc-lhs-arrays --use-loop-variable-after-loop --no-style-suggestions"
+ + mkdir -p build/dependencies
+OutputUnit.f90                         done.
+ArgumentBase.f90                       done.
+Workflow.f90                           done.
+Kinds.f90                              done.
+Version.f90                            done.
+rhofunc.f90                            done.
+EquationConstants.f90                  done.
+precmod.f90                            done.
+FEQParse_FloatStacks.F90               done.
+FEQParse_TokenStack.F90                done.
+FEQParse_Functions.F90                 done.
+error_module.f90                       done.
+params.f90                             done.
+FortranParser_parameters.f90           done.
+fparser.f90                            done.
+precision.f90                          done.
+M_Calculator.f90                       done.
+SystemInfo.f90                         done.
+Warning.f90                            done.
+Options.f90                            done.
+String.f90                             done.
+SteadyStateDetection.f90               done.
+Timer.f90                              done.
+Statistics.f90                         done.
+AllocataionLibrary.f90                 done.
+Parameters.f90                         done.
+equationparser.f90                     done.
+stringmod.f90                          done.
+FEQParse.F90                           done.
+function_parser.f90                    done.
+extrafunc.f90                          done.
+fortranparser.f90                      done.
+fee.f90                                done.
+Argument.f90                           done.
+System.f90                             done.
+Setup.f90                              done.
+Compiler.f90                           done.
+Utility.f90                            done.
+Abstract.f90                           done.
+evalmod.f90                            done.
+interpreter.f90                        done.
+Method.f90                             done.
+Runner6.f90                            done.
+Runner9.f90                            done.
+Runner2.f90                            done.
+Runner3.f90                            done.
+Runner8.f90                            done.
+Runner1.f90                            done.
+Runner5.f90                            done.
+Runner4.f90                            done.
+References.f90                         done.
+Runner7.f90                            done.
+Run.f90                                done.
+DryRun.f90                             done.
+Factory.f90                            done.
+Steps.f90                              done.
+Runner.f90                             done.
+Benchmark.f90                          done.
+libbenchmark.a                         done.
+Simple.f90                             done.
+Poisson.f90                            done.
+Allocation.f90                         done.
+UpperCasing.f90                        done.
+Parsers.f90                            done.
+simple                                 done.
+poisson                                done.
+allocation                             done.
+uppercasing                            done.
+parsers                                done.
+[100%] Project compiled successfully.
+(lf) root@LAPTOP-8SLTQKJO:~/benchmark.f#</code></pre>
+
+    <p class="mb-4 leading-relaxed">
+      <strong>Next Steps:</strong> My primary focus for next week is to iterate on the fixes for the open PRs based on
+      reviewer feedback, and then moving forward to the test suite to ensure runtime correctness.
+    </p>
+
+    <p class="mb-8 mt-6 leading-relaxed bg-blue-50 border-l-4 border-blue-500 p-4 text-blue-800 rounded">
+      <strong>Time Log:</strong> I worked around 30 hours this week, diving into procedure pointer bitcasting, ASR
+      verification edge cases, and external linkage linker errors.
+    </p>
+
+    <!-- ===== Acknowledgments ===== -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Acknowledgments</h3>
+    <p class="mb-4 leading-relaxed">
+      I would like to thank <a href="https://github.com/assem2002" target="_blank"
+        class="text-blue-600 hover:underline">Assem Medhat</a> and <a href="https://github.com/HarshitaKalani"
+        target="_blank" class="text-blue-600 hover:underline">Harshita
+        Kalani</a> for the detailed code reviews, as well as <a href="https://github.com/certik" target="_blank"
+        class="text-blue-600 hover:underline">Ondřej Čertík</a> for his guidance and continuous support on the project.
+    </p>
+
+  </section>
+
+  <!-- Navigation -->
+  <section class="px-6 max-w-4xl mx-auto flex justify-between py-6 border-t">
+    <a href="week7.html" class="text-blue-600 hover:underline font-medium">← Previous Week</a>
+    <a href="gsoc26.html" class="text-blue-600 hover:underline font-medium">Blog Home</a>
+  </section>
+
+  <!-- Footer -->
+  <footer class="bg-gray-100 text-center py-8 text-sm text-gray-600">
+    <div class="flex justify-center space-x-6 mb-2 text-gray-700 text-xl">
+      <a href="https://github.com/Jatinagarwal24" target="_blank"><i class="fab fa-github hover:text-gray-900"></i></a>
+      <a href="mailto:23110147@iitgn.ac.in"><i class="fas fa-envelope hover:text-gray-900"></i></a>
+    </div>
+    <p>Thanks for reading and for following along this summer. ❤️</p>
+  </footer>
+
+</body>
+
+</html>
