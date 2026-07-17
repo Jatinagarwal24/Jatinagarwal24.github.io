@@ -1,0 +1,993 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Week 9 - GSoC 2026 Blog</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" />
+</head>
+
+<body class="bg-white text-gray-800 font-sans">
+
+  <!-- Header -->
+  <section class="bg-gradient-to-r from-gray-700 to-gray-900 text-white text-center py-12">
+    <h2 class="text-3xl md:text-4xl font-extrabold tracking-widest">Compiling Benchmark.f and feq-parse with LFortran
+    </h2>
+    <p class="mt-2 text-lg font-medium">GSoC 2026 @Fortran-lang</p>
+    <p class="mt-1 text-sm text-gray-300">by Jatin Agarwal</p>
+  </section>
+
+  <!-- Blog Content -->
+  <section class="px-6 py-10 max-w-4xl mx-auto">
+
+    <h1 class="text-2xl md:text-3xl font-bold mb-1">Week 9 - Fixing Procedure Pointers, Allocatable Scalars, and
+      Completing feq-parse</h1>
+    <p class="text-sm text-gray-500 mb-6">July 11 – July 17, 2026</p>
+
+    <p class="mb-4 leading-relaxed">
+      This week involved a mix of fixing LLVM codegen for procedure pointers, refining my previous approach with
+      <code>ArrayPhysicalCast</code>, and resolving a segmentation fault that allowed me to finally compile the
+      <code>feq-parse</code> package!
+    </p>
+
+    <!-- PR 12184 -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Fixing Procedure Pointer Type Mismatch in Cross-Struct Association (<a
+        href="https://github.com/lfortran/lfortran/pull/12184" target="_blank" class="text-blue-600 hover:underline">PR
+        #12184</a> for <a href="https://github.com/lfortran/lfortran/issues/12182" target="_blank"
+        class="text-blue-600 hover:underline">Issue #12182</a>)</h3>
+
+    <p class="mb-4 leading-relaxed">
+      <strong>The Problem:</strong> When associating a typed procedure pointer from one struct member to a generic
+      <code>procedure()</code> pointer slot in another struct (e.g. <code>mtd%caller => this%caller</code>), the LLVM
+      codegen stored the value without bitcasting. This caused a
+      <code>Stored value type does not match pointer operand type</code> verification failure on LLVM &lt; 15 which
+      still uses typed pointers.
+    </p>
+
+    <p class="mb-2 font-semibold">Minimal Reproducible Example (MRE):</p>
+    <pre class="bg-gray-100 p-4 rounded-md overflow-x-auto text-sm font-mono mt-2 mb-4"><code>module mod_method
+  implicit none
+  type :: method
+      procedure(), nopass, pointer :: caller => null()
+  end type
+end module
+
+module mod_runner
+  use mod_method
+  implicit none
+  type :: runner
+      procedure(), nopass, pointer :: caller => null()
+  contains
+      procedure, pass(this) :: set_caller
+      procedure, pass(this) :: benchmark_a1
+  end type
+contains
+  subroutine set_caller(this, caller)
+      class(runner), intent(inout) :: this
+      procedure() :: caller
+      this%caller => caller
+  end subroutine
+
+  subroutine benchmark_a1(this, a1, f)
+      class(runner), intent(inout) :: this
+      class(*), intent(in) :: a1
+      procedure() :: f
+      type(method) :: mtd
+      if (associated(this%caller)) mtd%caller => this%caller
+  end subroutine
+end module</code></pre>
+
+    <p class="mb-4 leading-relaxed">
+      <strong>The Solution:</strong> The root of the problem was that the compiler's Abstract Semantic Representation
+      (ASR) represented procedure pointer members as <code>Pointer(FunctionType)</code>. During the translation to LLVM
+      IR, this fell into a generic fallback branch inside <code>visit_Associate</code>. To fix it, I explicitly cast the
+      concrete function pointer to a generic <code>void()*</code> slot using an LLVM bitcast. I also added a version
+      guard (<code>#if LLVM_VERSION_MAJOR &lt; 15</code>) so this cast only applies to older LLVM versions that still
+      enforce typed pointers, satisfying the LLVM verifier.
+    </p>
+
+    <!-- PR 12110 Iteration -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Iterating on ArrayPhysicalCast Implementation (<a
+        href="https://github.com/lfortran/lfortran/pull/12110" target="_blank" class="text-blue-600 hover:underline">PR
+        #12110</a>)</h3>
+
+    <p class="mb-4 leading-relaxed">
+      <strong>The Problem:</strong> Last week, I worked on fixing a procedure pointer verification failure by inserting
+      an explicit bitcast at the LLVM IR level. However, after discussing with Assem, I realized that the root cause
+      was actually earlier in the pipeline: the <code>ArrayPhysicalCast</code> nodes were being prematurely removed
+      during ASR processing.
+    </p>
+
+    <p class="mb-4 leading-relaxed">
+      <strong>The Solution:</strong> Instead of using a quick bitcast hack in the LLVM backend like I tried initially, I
+      went back to the ASR level. By stepping through <code>make_ArrayPhysicalCast_t_util</code>, I found exactly where
+      the compiler was mistakenly stripping away <code>ArrayPhysicalCast</code> nodes. I modified the logic to preserve
+      these casts whenever they're needed for procedure pointer interfaces. This way, the fix is much cleaner and
+      happens right in the frontend where it belongs.
+    </p>
+    <p class="mb-4 leading-relaxed">
+      Once this PR and the previous ones are merged into the main branch, I will be fully compiling the
+      <code>benchmark.f</code> package and moving on to evaluating the test suite!
+    </p>
+
+    <!-- feq-parse -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Fixing Segmentation Fault in Allocatable Scalar Assignment (<a
+        href="https://github.com/lfortran/lfortran/issues/12220" target="_blank"
+        class="text-blue-600 hover:underline">Issue #12220</a>)</h3>
+
+    <p class="mb-4 leading-relaxed">
+      <strong>The Problem:</strong> I encountered a severe issue where LFortran would throw a
+      <code>Segmentation fault (core dumped)</code> when trying to assign between allocatable scalar variables (e.g.
+      <code>b = a</code> where both are <code>integer, allocatable</code>). This was one of the final blockers for
+      compiling the <code>feq-parse</code> package.
+    </p>
+
+    <p class="mb-2 font-semibold">Minimal Reproducible Example (MRE):</p>
+    <pre class="bg-gray-100 p-4 rounded-md overflow-x-auto text-sm font-mono mt-2 mb-4"><code>program mre_alloc_int
+  implicit none
+  integer, allocatable :: a, b
+  a = 10
+  b = a
+  print *, b
+end program mre_alloc_int</code></pre>
+
+    <p class="mb-4 leading-relaxed">
+      <strong>The Solution:</strong> I dug into the LLVM code generation in <code>asr_to_llvm.cpp</code> and traced the
+      crash down to how assignments were lowered. The compiler was blindly dereferencing the destination's pointer to
+      store the new value. But for allocatable scalars, if the variable hasn't been allocated yet, its pointer is null!
+      Dereferencing a null pointer is a classic recipe for a segfault. To fix this, I added a call to
+      <code>check_and_allocate_scalar()</code> before the actual copy happens for basic intrinsic types (Integer, Real,
+      Complex, Logical). This ensures memory is safely dynamically allocated on the fly if it doesn't exist yet, cleanly
+      resolving the crash.
+    </p>
+
+    <p class="mb-4 leading-relaxed">
+      With this fix merged, I am finally able to fully build and test the <code>feq-parse</code> project without any
+      issues. Here is the terminal output showing a successful compilation and test run:
+    </p>
+
+    <pre
+      class="bg-gray-100 text-gray-800 p-4 rounded-md overflow-x-auto max-h-96 overflow-y-auto text-xs sm:text-sm font-mono mt-2 mb-6"><code>(lf) root@LAPTOP-8SLTQKJO:~/feq-parse# fpm build --compiler=lfortran --flag "--cpp --realloc-lhs-arrays --use-loop-variable-after-loop --no-style-suggestions"
+ + mkdir -p build/dependencies
+FEQParse_TokenStack.f90                done.
+FEQParse_Functions.f90                 done.
+FEQParse_FloatStacks.f90               done.
+FEQParse.f90                           done.
+libfeq-parse.a                         done.
+array_with_array_eval.f90              done.
+array_with_scalar_eval.f90             done.
+scalar_with_scalar_eval.f90            done.
+scalar_function_product.f90            done.
+gaussian_scalar_multivar.f90           done.
+array_with_array_eval                  done.
+array_with_scalar_eval                 done.
+scalar_with_scalar_eval                done.
+scalar_function_product                done.
+gaussian_scalar_multivar               done.
+[100%] Project compiled successfully.
+(lf) root@LAPTOP-8SLTQKJO:~/feq-parse# 
+(lf) root@LAPTOP-8SLTQKJO:~/feq-parse# fpm test --compiler=lfortran --flag "--cpp --realloc-lhs-arrays --use-loop-variable-after-loop --no-style-suggestions"
+tan_r2fp64.f90                         done.
+asin_r1fp64.f90                        done.
+cos_r3fp32.f90                         done.
+acos_r1fp64.f90                        done.
+log_r4fp32.f90                         done.
+gaussian3d_r1fp32.f90                  done.
+log10_r3fp64.f90                       done.
+tanh_r4fp64.f90                        done.
+acos_r2fp64.f90                        done.
+gaussian3d_sfp32.f90                   done.
+division_r2fp64.f90                    done.
+tan_r1fp64.f90                         done.
+sin_r2fp32.f90                         done.
+abs_r1fp32.f90                         done.
+acos_r1fp32.f90                        done.
+log10_r2fp32.f90                       done.
+cosh_r1fp64.f90                        done.
+linear_r2fp32.f90                      done.
+cos_r2fp64.f90                         done.
+cos_r2fp32.f90                         done.
+sech_r3fp32.f90                        done.
+log_r4fp64.f90                         done.
+sinh_r1fp64.f90                        done.
+log_sfp32.f90                          done.
+monadic_r3fp32.f90                     done.
+acos_sfp32.f90                         done.
+linear_r4fp32.f90                      done.
+atan_r1fp64.f90                        done.
+log10_sfp64.f90                        done.
+monadic_r2fp64.f90                     done.
+gaussian3d_r1fp64.f90                  done.
+abs_sfp64.f90                          done.
+monadic_sfp32.f90                      done.
+tan_r2fp32.f90                         done.
+sech_sfp64.f90                         done.
+tanh_r1fp32.f90                        done.
+sin_r2fp64.f90                         done.
+monadic_r1fp64.f90                     done.
+tan_r4fp32.f90                         done.
+linear_r1fp64.f90                      done.
+abs_r3fp64.f90                         done.
+division_r1fp64.f90                    done.
+division_r1fp32.f90                    done.
+asin_r3fp64.f90                        done.
+log_r2fp32.f90                         done.
+acos_r3fp32.f90                        done.
+sqrt_r2fp32.f90                        done.
+acos_r3fp64.f90                        done.
+log10_r1fp32.f90                       done.
+log10_r4fp64.f90                       done.
+sin_r1fp32.f90                         done.
+tanh_r2fp64.f90                        done.
+tanh_r1fp64.f90                        done.
+tan_sfp64.f90                          done.
+cos_r4fp64.f90                         done.
+log_r1fp32.f90                         done.
+sin_sfp32.f90                          done.
+division_sfp64.f90                     done.
+gaussian3d_r2fp32.f90                  done.
+sech_r1fp32.f90                        done.
+cos_sfp64.f90                          done.
+log_sfp64.f90                          done.
+sin_r4fp32.f90                         done.
+atan_r4fp32.f90                        done.
+sin_r1fp64.f90                         done.
+division_r3fp64.f90                    done.
+parsing_vanderpol_sfp64.f90            done.
+sinh_r1fp32.f90                        done.
+sin_sfp64.f90                          done.
+sqrt_r3fp32.f90                        done.
+tan_r4fp64.f90                         done.
+print_tokens.f90                       done.
+sqrt_r2fp64.f90                        done.
+sqrt_sfp32.f90                         done.
+sech_r1fp64.f90                        done.
+atan_sfp64.f90                         done.
+atan_r4fp64.f90                        done.
+division_r4fp32.f90                    done.
+division_r3fp32.f90                    done.
+log_r1fp64.f90                         done.
+linear_r3fp32.f90                      done.
+tanh_sfp32.f90                         done.
+sech_r2fp64.f90                        done.
+log_r3fp64.f90                         done.
+log10_r2fp64.f90                       done.
+atan_r1fp32.f90                        done.
+monadic_r2fp32.f90                     done.
+sech_r2fp32.f90                        done.
+tan_r3fp64.f90                         done.
+parsing_difficult_r1fp64.f90           done.
+asin_r1fp32.f90                        done.
+acos_r2fp32.f90                        done.
+asin_r3fp32.f90                        done.
+asin_r2fp32.f90                        done.
+sech_r4fp64.f90                        done.
+atan_r2fp32.f90                        done.
+tanh_r3fp64.f90                        done.
+abs_sfp32.f90                          done.
+sqrt_r1fp32.f90                        done.
+sin_r4fp64.f90                         done.
+gaussian3d_r3fp32.f90                  done.
+sin_r3fp64.f90                         done.
+cos_r1fp64.f90                         done.
+linear_r3fp64.f90                      done.
+gaussian3d_sfp64.f90                   done.
+acos_r4fp32.f90                        done.
+monadic_r4fp32.f90                     done.
+custom_r1fp32.f90                      done.
+asin_sfp64.f90                         done.
+asin_r4fp32.f90                        done.
+monadic_r1fp32.f90                     done.
+abs_r2fp64.f90                         done.
+log10_r4fp32.f90                       done.
+asin_sfp32.f90                         done.
+monadic_sfp64.f90                      done.
+abs_r1fp64.f90                         done.
+cos_r3fp64.f90                         done.
+log_r2fp64.f90                         done.
+abs_r4fp32.f90                         done.
+log10_r3fp32.f90                       done.
+atan_r3fp32.f90                        done.
+monadic_r3fp64.f90                     done.
+sqrt_r4fp32.f90                        done.
+division_sfp32.f90                     done.
+sin_r3fp32.f90                         done.
+sqrt_r1fp64.f90                        done.
+tan_r3fp32.f90                         done.
+gaussian3d_r2fp64.f90                  done.
+sech_sfp32.f90                         done.
+monadic_r4fp64.f90                     done.
+atan_sfp32.f90                         done.
+division_r4fp64.f90                    done.
+acos_sfp64.f90                         done.
+cos_sfp32.f90                          done.
+linear_r1fp32.f90                      done.
+log10_r1fp64.f90                       done.
+abs_r2fp32.f90                         done.
+linear_r2fp64.f90                      done.
+tan_sfp32.f90                          done.
+asin_r4fp64.f90                        done.
+atan_r3fp64.f90                        done.
+atan_r2fp64.f90                        done.
+gaussian3d_r3fp64.f90                  done.
+tanh_sfp64.f90                         done.
+abs_r3fp32.f90                         done.
+acos_r4fp64.f90                        done.
+division_r2fp32.f90                    done.
+custom_r1fp64.f90                      done.
+sqrt_r4fp64.f90                        done.
+tan_r1fp32.f90                         done.
+sqrt_r3fp64.f90                        done.
+sqrt_sfp64.f90                         done.
+cos_r1fp32.f90                         done.
+sech_r4fp32.f90                        done.
+log_r3fp32.f90                         done.
+gaussian3d_r4fp32.f90                  done.
+asin_r2fp64.f90                        done.
+parsing_simple_r1fp32.f90              done.
+log10_sfp32.f90                        done.
+abs_r4fp64.f90                         done.
+tanh_r4fp32.f90                        done.
+tanh_r2fp32.f90                        done.
+tanh_r3fp32.f90                        done.
+cos_r4fp32.f90                         done.
+gaussian3d_r4fp64.f90                  done.
+linear_r4fp64.f90                      done.
+sech_r3fp64.f90                        done.
+cosh_r1fp32.f90                        done.
+tan_r2fp64                             done.
+asin_r1fp64                            done.
+cos_r3fp32                             done.
+acos_r1fp64                            done.
+log_r4fp32                             done.
+gaussian3d_r1fp32                      done.
+log10_r3fp64                           done.
+tanh_r4fp64                            done.
+acos_r2fp64                            done.
+gaussian3d_sfp32                       done.
+division_r2fp64                        done.
+tan_r1fp64                             done.
+sin_r2fp32                             done.
+abs_r1fp32                             done.
+acos_r1fp32                            done.
+log10_r2fp32                           done.
+cosh_r1fp64                            done.
+linear_r2fp32                          done.
+cos_r2fp64                             done.
+cos_r2fp32                             done.
+sech_r3fp32                            done.
+log_r4fp64                             done.
+sinh_r1fp64                            done.
+log_sfp32                              done.
+monadic_r3fp32                         done.
+acos_sfp32                             done.
+linear_r4fp32                          done.
+atan_r1fp64                            done.
+log10_sfp64                            done.
+monadic_r2fp64                         done.
+gaussian3d_r1fp64                      done.
+abs_sfp64                              done.
+monadic_sfp32                          done.
+tan_r2fp32                             done.
+sech_sfp64                             done.
+tanh_r1fp32                            done.
+sin_r2fp64                             done.
+monadic_r1fp64                         done.
+tan_r4fp32                             done.
+linear_r1fp64                          done.
+abs_r3fp64                             done.
+division_r1fp64                        done.
+division_r1fp32                        done.
+asin_r3fp64                            done.
+log_r2fp32                             done.
+acos_r3fp32                            done.
+sqrt_r2fp32                            done.
+acos_r3fp64                            done.
+log10_r1fp32                           done.
+log10_r4fp64                           done.
+sin_r1fp32                             done.
+tanh_r2fp64                            done.
+tanh_r1fp64                            done.
+tan_sfp64                              done.
+cos_r4fp64                             done.
+log_r1fp32                             done.
+sin_sfp32                              done.
+division_sfp64                         done.
+gaussian3d_r2fp32                      done.
+sech_r1fp32                            done.
+cos_sfp64                              done.
+log_sfp64                              done.
+sin_r4fp32                             done.
+atan_r4fp32                            done.
+sin_r1fp64                             done.
+division_r3fp64                        done.
+parsing_vanderpol_sfp64                done.
+sinh_r1fp32                            done.
+sin_sfp64                              done.
+sqrt_r3fp32                            done.
+tan_r4fp64                             done.
+print_tokens                           done.
+sqrt_r2fp64                            done.
+sqrt_sfp32                             done.
+sech_r1fp64                            done.
+atan_sfp64                             done.
+atan_r4fp64                            done.
+division_r4fp32                        done.
+division_r3fp32                        done.
+log_r1fp64                             done.
+linear_r3fp32                          done.
+tanh_sfp32                             done.
+sech_r2fp64                            done.
+log_r3fp64                             done.
+log10_r2fp64                           done.
+atan_r1fp32                            done.
+monadic_r2fp32                         done.
+sech_r2fp32                            done.
+tan_r3fp64                             done.
+parsing_difficult_r1fp64               done.
+asin_r1fp32                            done.
+acos_r2fp32                            done.
+asin_r3fp32                            done.
+asin_r2fp32                            done.
+sech_r4fp64                            done.
+atan_r2fp32                            done.
+tanh_r3fp64                            done.
+abs_sfp32                              done.
+sqrt_r1fp32                            done.
+sin_r4fp64                             done.
+gaussian3d_r3fp32                      done.
+sin_r3fp64                             done.
+cos_r1fp64                             done.
+linear_r3fp64                          done.
+gaussian3d_sfp64                       done.
+acos_r4fp32                            done.
+monadic_r4fp32                         done.
+custom_r1fp32                          done.
+asin_sfp64                             done.
+asin_r4fp32                            done.
+monadic_r1fp32                         done.
+abs_r2fp64                             done.
+log10_r4fp32                           done.
+asin_sfp32                             done.
+monadic_sfp64                          done.
+abs_r1fp64                             done.
+cos_r3fp64                             done.
+log_r2fp64                             done.
+abs_r4fp32                             done.
+log10_r3fp32                           done.
+atan_r3fp32                            done.
+monadic_r3fp64                         done.
+sqrt_r4fp32                            done.
+division_sfp32                         done.
+sin_r3fp32                             done.
+sqrt_r1fp64                            done.
+tan_r3fp32                             done.
+gaussian3d_r2fp64                      done.
+sech_sfp32                             done.
+monadic_r4fp64                         done.
+atan_sfp32                             done.
+division_r4fp64                        done.
+acos_sfp64                             done.
+cos_sfp32                              done.
+linear_r1fp32                          done.
+log10_r1fp64                           done.
+abs_r2fp32                             done.
+linear_r2fp64                          done.
+tan_sfp32                              done.
+asin_r4fp64                            done.
+atan_r3fp64                            done.
+atan_r2fp64                            done.
+gaussian3d_r3fp64                      done.
+tanh_sfp64                             done.
+abs_r3fp32                             done.
+acos_r4fp64                            done.
+division_r2fp32                        done.
+custom_r1fp64                          done.
+sqrt_r4fp64                            done.
+tan_r1fp32                             done.
+sqrt_r3fp64                            done.
+sqrt_sfp64                             done.
+cos_r1fp32                             done.
+sech_r4fp32                            done.
+log_r3fp32                             done.
+gaussian3d_r4fp32                      done.
+asin_r2fp64                            done.
+parsing_simple_r1fp32                  done.
+log10_sfp32                            done.
+abs_r4fp64                             done.
+tanh_r4fp32                            done.
+tanh_r2fp32                            done.
+tanh_r3fp32                            done.
+cos_r4fp32                             done.
+gaussian3d_r4fp64                      done.
+linear_r4fp64                          done.
+sech_r3fp64                            done.
+cosh_r1fp32                            done.
+[100%] Project compiled successfully.
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+2.0
+pi
+*
+x
+*
+sin
+2.0
+pi
+*
+y
+*
+sin
+*
+STOP 0
+STOP 0
+STOP 0
+x
+log10
+y
+log10
+*
+STOP 0
+STOP 0
+x
+3
+^
+1
+-
+y
+3
+^
+1
+-
+*
+STOP 0
+STOP 0
+2.0
+pi
+*
+x
+*
+cos
+2.0
+pi
+*
+y
+*
+cos
+*
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+0.5
+pi
+*
+x
+*
+tan
+0.5
+pi
+*
+y
+*
+tan
+*
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+x
+ln
+y
+ln
+*
+STOP 0
+STOP 0
+x
+sqrt
+y
+sqrt
+*
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+x
+2
+^
+y
+2
+^
++
+-
+exp
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+--------- Infix -------------------
+-
+8.53
+*
+(
+1
+-
+x
+*
+x
+)
+*
+v
+-
+y
+-----------------------------------
+--------- Postfix -------------------
+8.53 1
+- 7
+1 1
+x 2
+x 2
+* 3
+- 3
+* 3
+v 2
+* 3
+y 2
+- 3
+-----------------------------------
+-3.0000000000000000 -3.0000000000000000
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+-
+(
+cos
+(
+2.0
+*
+pi
+*
+x
+)
++
+5.0
+)
+/
+(
+sin
+(
+2.0
+*
+pi
+*
+y
+)
++
+10.0
+)
+*
+tanh
+(
+z
+)
+2.0 1
+pi 1
+* 3
+x 2
+* 3
+cos 4
+5.0 1
++ 3
+- 7
+2.0 1
+pi 1
+* 3
+y 2
+* 3
+sin 4
+10.0 1
++ 3
+/ 3
+z 2
+tanh 4
+* 3
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+x
+1
++
+-
+y
+1
++
+*
+STOP 0
+x
+sech
+y
+sech
+*
+STOP 0
+STOP 0
+parsing a+b*x1                                                                       
+                                                                                     
+                                                         0
+parsing (a*x**b)/(c+x**b)                                                            
+                                                                                     
+                                                         0
+parsing (a*x)/(b+(x*(1+x/c)))                                                        
+                                                                                     
+                                                         0
+parsing a+b*exp(c*x)+d*exp(e*x)                                                      
+                                                                                     
+                                                         0
+parsing a+b*(exp(c*x) - 1)/c                                                         
+                                                                                     
+                                                         0
+parsing a+b*log(x)+c*log(x)**2                                                       
+                                                                                     
+                                                         0
+parsing a-log(1+b*exp(-c*x))                                                         
+                                                                                     
+                                                         0
+parsing (a+b*x)/(c+x)                                                                
+                                                                                     
+                                                         0
+parsing a+b*exp(-(c*x))                                                              
+                                                                                     
+                                                         0
+parsing a+b*sin(2*3.14*x/c+d)                                                        
+                                                                                     
+                                                         0
+parsing a+b*sin(2*4.14*x/c+d)**2                                                     
+                                                                                     
+                                                         0
+parsing 1-exp(-a*x)                                                                  
+                                                                                     
+                                                         0
+parsing a+b*x1+c*x2                                                                  
+                                                                                     
+                                                         0
+parsing a+b*log(x1)+c*log(x2)                                                        
+                                                                                     
+                                                         0
+parsing a*x1**b*x2**c                                                                
+                                                                                     
+                                                         0
+parsing cosh(log(abs(y*z+x**2+x1**x2)))+a*d*(exp(c*f)+154.3)                         
+                                                                                     
+                                                         0
+parsing a+b*log(x1)+c*x2+d*x2**2                                                     
+                                                                                     
+                                                         0
+parsing atan(sinh(log(abs(exp(z/x)*sqrt(y+a**c+f*e)))))                              
+                                                                                     
+                                                         0
+parsing a+b/x1+c*log(x2)+d*log(x2)**2+e*log(x2)**3                                   
+                                                                                     
+                                                         0
+parsing atan(sinh(log(abs(exp(z/x)*sqrt(y+a**c+f*e)))))*cos(log(abs(sqrt(y+a**c+f*e))))                                                                                   
+                                                         0
+parsing a+b*log(x1)+c*log(x1)**2+d/x2+e/x2**2                                        
+                                                                                     
+                                                         0
+parsing (x+a)/(b+c*(x+a)+d*(x+a)**2)                                                 
+                                                                                     
+                                                         0
+parsing (x+y+z+x*y+x*z+y*z+x/y+x/z+y/z+x*cos(x)+y*sin(y)+z*tan(z)*2/(x+y+z+x*y+x*z+y*z+x/y+  x/z+y/z+x*cos(x)+y*sin(y)+z*tan(z))*3+sqrt(x*y*z+x+y+z)*log10(sqrt(x*2+y*2+z*2)+x+y+z))                                               0
+parsing a+b*log(x1)+c*log(x1)**2+d*log(x1)**3+e/x                                    
+                                                                                     
+                                                         0
+STOP 0
+x
+acos
+y
+acos
+*
+STOP 0
+STOP 0
+x
+asin
+y
+asin
+*
+STOP 0
+STOP 0
+x
+atan
+y
+atan
+*
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+test                    0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+x
+y
++
+abs
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+x
+1
++
+-
+y
+1
++
+10.0
+/
+*
+STOP 0
+test                    0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+x
+tanh
+y
+tanh
+*
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+STOP 0
+(lf) root@LAPTOP-8SLTQKJO:~/feq-parse#</code></pre>
+
+    <!-- ===== Progress & Next Steps ===== -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Progress & Next Steps</h3>
+    <p class="mb-4 leading-relaxed">
+      My primary focus for next week is to ensure these final PRs are merged smoothly and to start testing
+      phase on the <code>benchmark.f</code> test suite.
+    </p>
+
+    <p class="mb-8 mt-6 leading-relaxed bg-blue-50 border-l-4 border-blue-500 p-4 text-blue-800 rounded">
+      <strong>Time Log:</strong> I worked around 30 hours this week, diving into equivalence type validation, refining
+      ASR transformations for ArrayPhysicalCast, and fixing edge cases for the feq-parse package.
+    </p>
+
+    <!-- ===== Acknowledgments ===== -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Acknowledgments</h3>
+    <p class="mb-4 leading-relaxed">
+      I would like to thank <a href="https://github.com/assem2002" target="_blank"
+        class="text-blue-600 hover:underline">Assem Medhat</a> and <a href="https://github.com/HarshitaKalani"
+        target="_blank" class="text-blue-600 hover:underline">Harshita
+        Kalani</a> for the detailed code reviews and discussions, as well as <a href="https://github.com/certik"
+        target="_blank" class="text-blue-600 hover:underline">Ondřej Čertík</a> for his continuous support on the
+      project.
+    </p>
+
+  </section>
+
+  <!-- Navigation -->
+  <section class="px-6 max-w-4xl mx-auto flex justify-between py-6 border-t">
+    <a href="week8.html" class="text-blue-600 hover:underline font-medium">← Previous Week</a>
+    <a href="gsoc26.html" class="text-blue-600 hover:underline font-medium">Blog Home</a>
+  </section>
+
+  <!-- Footer -->
+  <footer class="bg-gray-100 text-center py-8 text-sm text-gray-600">
+    <div class="flex justify-center space-x-6 mb-2 text-gray-700 text-xl">
+      <a href="https://github.com/Jatinagarwal24" target="_blank"><i class="fab fa-github hover:text-gray-900"></i></a>
+      <a href="mailto:23110147@iitgn.ac.in"><i class="fas fa-envelope hover:text-gray-900"></i></a>
+    </div>
+    <p>Thanks for reading and for following along this summer. ❤️</p>
+  </footer>
+
+</body>
+
+</html>
