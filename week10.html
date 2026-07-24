@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Week 10 - GSoC 2026 Blog</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" />
+</head>
+
+<body class="bg-white text-gray-800 font-sans">
+
+  <!-- Header -->
+  <section class="bg-gradient-to-r from-gray-700 to-gray-900 text-white text-center py-12">
+    <h2 class="text-3xl md:text-4xl font-extrabold tracking-widest">Compiling Benchmark.f and feq-parse with LFortran
+    </h2>
+    <p class="mt-2 text-lg font-medium">GSoC 2026 @Fortran-lang</p>
+    <p class="mt-1 text-sm text-gray-300">by Jatin Agarwal</p>
+  </section>
+
+  <!-- Blog Content -->
+  <section class="px-6 py-10 max-w-4xl mx-auto">
+
+    <h1 class="text-2xl md:text-3xl font-bold mb-1">Week 10 - Namelist Pointer I/O, Preprocessor Fixes, and 100%
+      Compilation of benchmark.f</h1>
+    <p class="text-sm text-gray-500 mb-6">July 18 – July 24, 2026</p>
+
+    <p class="mb-4 leading-relaxed">
+      This week was a big milestone: I fixed two more LFortran bugs (namelist I/O of scalar pointers and a preprocessor
+      edge case in function-like macros), and I also found and reported two genuine bugs in the
+      <code>benchmark.f</code> package itself to its author, along with proposed fixes. With all of this in place, the
+      current LFortran main branch now compiles and tests <code>benchmark.f</code> to 100%!
+    </p>
+
+    <!-- Issue 12302 / PR 12303 -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Fixing Namelist I/O of Scalar Pointer/Allocatable Variables (<a
+        href="https://github.com/lfortran/lfortran/pull/12303" target="_blank" class="text-blue-600 hover:underline">PR
+        #12303</a> for <a href="https://github.com/lfortran/lfortran/issues/12302" target="_blank"
+        class="text-blue-600 hover:underline">Issue #12302</a>)</h3>
+
+    <p class="mb-4 leading-relaxed">
+      <strong>The Problem:</strong> When a namelist group contained a scalar <code>pointer</code> or
+      <code>allocatable</code> variable, LFortran printed the pointer itself instead of the value it points to. This
+      produced garbage values for intrinsic types (e.g. <code>x=4210792</code> instead of <code>x=10</code>) and even a
+      segmentation fault for pointers to derived types with character components.
+    </p>
+
+    <p class="mb-2 font-semibold">Minimal Reproducible Example (MRE):</p>
+    <pre class="bg-gray-100 p-4 rounded-md overflow-x-auto text-sm font-mono mt-2 mb-4"><code>program mre
+implicit none
+integer, target :: t = 10
+integer, pointer :: x => null()
+namelist / config / x
+x => t
+print *, 'plain print of x:', x
+write(*, nml=config)
+end program</code></pre>
+
+    <pre class="bg-gray-100 p-4 rounded-md overflow-x-auto text-sm font-mono mt-2 mb-4"><code>! LFortran (before the fix)
+plain print of x: 10
+ &config
+  x=4210792        &lt;-- garbage: the pointer itself, not its target!
+ /
+
+! gfortran (expected)
+ plain print of x:          10
+&CONFIG
+ X=10         ,
+ /</code></pre>
+
+    <p class="mb-4 leading-relaxed">
+      <strong>The Solution:</strong> Since a plain <code>print *, x</code> printed the correct value, I knew pointer
+      association itself was fine and the bug had to be in the namelist lowering. I traced it to
+      <code>build_namelist_descriptor</code> in the LLVM backend: for scalar pointer and allocatable items, the symbol
+      table value (which is the pointer variable's own storage) was passed directly as the data pointer in the
+      namelist descriptor. So at runtime, the I/O routines happily read the raw address as if it were the value, and
+      for pointers to derived types with character components they chased that bogus address and segfaulted.
+      Interestingly, pointer/allocatable <em>arrays</em> didn't have this problem, because their code path already
+      loaded through the pointer before building the descriptor. The fix was to do the same for non-character scalars:
+      emit a load through the symtab value first, so the descriptor always points at the actual target. I also added an
+      integration test (<code>namelist_36</code>) that round-trips a scalar integer pointer, a scalar real allocatable,
+      and a pointer to a derived type with a character component (the case that previously segfaulted).
+    </p>
+
+    <!-- Issue 12313 / PR 12314 -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Fixing Preprocessor Failure on <code>#define</code> Bodies Starting
+      Right After the Parenthesis (<a href="https://github.com/lfortran/lfortran/pull/12314" target="_blank"
+        class="text-blue-600 hover:underline">PR #12314</a> for <a
+        href="https://github.com/lfortran/lfortran/issues/12313" target="_blank"
+        class="text-blue-600 hover:underline">Issue #12313</a>)</h3>
+
+    <p class="mb-4 leading-relaxed">
+      <strong>The Problem:</strong> LFortran's preprocessor failed on function-like macros where the macro body starts
+      immediately after the closing parenthesis, a pattern used heavily in <code>benchmark.f</code>'s test framework.
+      The macro was silently ignored with a <code>#define ignored</code> warning, and the stray line-continuation
+      <code>\</code> then crashed the tokenizer with <code>Token '\' is not recognized</code>.
+    </p>
+
+    <p class="mb-2 font-semibold">Minimal Reproducible Example (MRE):</p>
+    <pre class="bg-gray-100 p-4 rounded-md overflow-x-auto text-sm font-mono mt-2 mb-4"><code>#define FOO(x)\
+print *, x; \
+print *, x;
+program main
+implicit none
+FOO('hello')
+end program</code></pre>
+
+    <p class="mb-4 leading-relaxed">
+      <strong>The Solution:</strong> Digging into the preprocessor, I found that the matching rules for function-like
+      macros <em>required</em> at least one whitespace character between the closing parenthesis and the macro body. A
+      definition like <code>#define FOO(x)\</code> therefore matched none of the macro rules, fell through to the
+      generic "#define ignored" branch, and the leftover <code>\</code> reached the tokenizer, which has no idea what
+      to do with a backslash. I made the whitespace optional in both the zero-argument and named-argument macro rules.
+      While doing that, I also uncovered a second latent bug: when the old optional whitespace-plus-body group didn't
+      match, its captures were left unset, and <code>token(t3, t4)</code> would read garbage, so I changed the rules
+      to always capture the body. Finally, I hooked <code>handle_continuation_lines</code> into the zero-argument rule
+      as well, so multi-line macro bodies get stitched together no matter which rule matched. I verified the expansion
+      against <code>gfortran -cpp</code> and added integration test <code>cpp_pre_18</code> covering both continuation
+      lines and bodies starting immediately after <code>)</code>.
+    </p>
+
+    <!-- benchmark.f upstream bugs -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Finding Real Bugs in benchmark.f Itself</h3>
+
+    <p class="mb-4 leading-relaxed">
+      Not every failure this week was LFortran's fault! While debugging the test suite, I discovered two genuine bugs in
+      the <code>benchmark.f</code> package and reported them upstream to the author with minimal reproducers and
+      proposed patches. Interestingly, LFortran's stricter runtime checks are what exposed both of them, while gfortran
+      silently masks them.
+    </p>
+
+    <h4 class="text-lg font-semibold mt-6 mb-2">1. Referencing an Unallocated Allocatable String (<a
+        href="https://github.com/davidpfister/benchmark.f/issues/7" target="_blank"
+        class="text-blue-600 hover:underline">benchmark.f Issue #7</a>)</h4>
+
+    <p class="mb-4 leading-relaxed">
+      <strong>The Problem:</strong> In <code>src/Argument.f90</code>, <code>arg_new_from_string</code> calls
+      <code>len_trim(display%chars)</code> without checking whether <code>chars</code> is allocated. But
+      <code>parse_names</code> in <code>src/Benchmark.f90</code> returns a fixed-size <code>names(7)</code> array where
+      only the parsed slots get <code>chars</code> allocated, and the <code>run</code> methods construct arguments for
+      all 7 slots regardless. Passing an unallocated allocatable to <code>len_trim</code> is non-conforming (F2018
+      15.5.2.12). gfortran silently returns 0 so it goes unnoticed, but LFortran's runtime check correctly stops with
+      <code>Argument 1 of len_trim ... is unallocated</code>, breaking <code>test_calling</code>.
+    </p>
+
+    <p class="mb-2 font-semibold">Minimal Reproducible Example (MRE):</p>
+    <pre class="bg-gray-100 p-4 rounded-md overflow-x-auto text-sm font-mono mt-2 mb-4"><code>module string_m
+    implicit none
+    type :: string
+        character(:), allocatable :: chars
+    end type
+contains
+    ! mimics parse_names: fixed-size result, only parsed slots get assigned
+    function parse_names(n) result(names)
+        integer, intent(in) :: n
+        type(string) :: names(n)
+        names(1)%chars = 'a1'
+        names(2)%chars = 'a2'
+    end function
+
+    ! mimics arg_new_from_string (src/Argument.f90)
+    subroutine arg_new_from_string(display)
+        class(string), intent(in) :: display
+        print *, 'len_trim =', len_trim(display%chars)
+    end subroutine
+end module
+
+program mre
+    use string_m
+    implicit none
+    type(string) :: names(7)
+    names = parse_names(7)
+    call arg_new_from_string(names(1))   ! ok
+    call arg_new_from_string(names(4))   ! never assigned -> non-conforming
+end program</code></pre>
+
+    <p class="mb-4 leading-relaxed">
+      <strong>The Fix:</strong> I proposed a patch guarding every access with <code>allocated()</code> checks, both in
+      <code>arg_new_from_string</code> and in the same unguarded pattern in <code>src/String.f90</code>
+      (<code>string_assign_character</code> and <code>string_len</code>, which now returns 0 for an unallocated
+      string). The author confirmed the bug and merged the fix.
+    </p>
+
+    <h4 class="text-lg font-semibold mt-6 mb-2">2. Passing <code>class(*)</code> Arguments Through an
+      Implicit-Interface Procedure Pointer (<a href="https://github.com/davidpfister/benchmark.f/issues/8"
+        target="_blank" class="text-blue-600 hover:underline">benchmark.f Issue #8</a>)</h4>
+
+    <p class="mb-4 leading-relaxed">
+      <strong>The Problem:</strong> In <code>src/Method.f90</code>, <code>invoke_a0</code> calls the benchmarked
+      procedure as <code>call this%f(arg1, arg2)</code>, where <code>f</code> is a
+      <code>procedure(), nopass, pointer</code> (implicit interface) and <code>arg1</code>/<code>arg2</code> are
+      <code>class(*)</code> associate-names. Polymorphic actual arguments require an explicit interface (F2018
+      15.4.2.2). With no interface, there is no defined way to pass the value, so the callee receives an address
+      instead of the data. I verified by printing the arguments inside the benchmarked routine: instead of
+      <code>a=1.0d-6, m=30</code> it received <code>a ≈ 5e-310</code> and <code>m</code> in the millions, under
+      <strong>both</strong> gfortran and LFortran! So the benchmark was actually timing a garbage-bounded loop, and
+      nothing caught it since outputs are never validated.
+    </p>
+
+    <p class="mb-2 font-semibold">Minimal Reproducible Example (MRE):</p>
+    <pre class="bg-gray-100 p-4 rounded-md overflow-x-auto text-sm font-mono mt-2 mb-4"><code>module method_m
+    implicit none
+    type :: arg
+        class(*), allocatable :: value
+    end type
+    type :: method
+        procedure(), nopass, pointer :: f => null()
+        type(arg), allocatable :: args(:)
+    contains
+        procedure :: invoke
+    end type
+contains
+    subroutine work(a, n)
+        real(8), intent(in) :: a
+        integer, intent(in) :: n
+        if (a == 1.0d-6 .and. n == 30) then
+            print *, 'OK: work received a=', a, ' n=', n
+        else
+            print *, 'FAILED: work received a=', a, ' n=', n
+            stop 1
+        end if
+    end subroutine
+
+    type(method) function make(f, a1, a2) result(mtd)
+        procedure() :: f
+        class(*), intent(in) :: a1, a2
+        mtd%f => f
+        allocate(mtd%args(2))
+        allocate(mtd%args(1)%value, source=a1)
+        allocate(mtd%args(2)%value, source=a2)
+    end function
+
+    ! mimics Method.f90 invoke_a0 case (2)
+    subroutine invoke(this)
+        class(method), intent(inout) :: this
+        associate(arg1 => this%args(1)%value, arg2 => this%args(2)%value)
+            call this%f(arg1, arg2)
+        end associate
+    end subroutine
+end module
+
+program mre
+    use method_m
+    implicit none
+    type(method) :: mtd
+    mtd = make(work, 1.0d-6, 30)
+    call mtd%invoke()
+end program</code></pre>
+
+    <pre class="bg-gray-100 p-4 rounded-md overflow-x-auto text-sm font-mono mt-2 mb-4"><code>! LFortran
+FAILED: work received a= 2.0820123942008466E-317  n= 4214080
+
+! gfortran (same garbage!)
+ FAILED: work received a=   5.2277794488084471E-310  n=   619719024</code></pre>
+
+    <p class="mb-4 leading-relaxed">
+      <strong>The Fix:</strong> Along with the report, I proposed a patch to the test suite (accepting LFortran's
+      output formatting alongside gfortran's and making a platform-dependent file-size check tolerant). We also had a
+      nice discussion about subroutine-vs-function procedure arguments across compilers: gfortran rejects passing a
+      function where a subroutine is expected, while LFortran is more permissive through implicit interfaces. The
+      author fixed the bugs and pointed out that the safe way to use the library is the explicit-interface
+      <code>set_caller</code> mechanism, which is exactly the code path I fixed in LFortran back in Week 9!
+    </p>
+
+    <!-- ===== Progress & Next Steps ===== -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Progress & Next Steps</h3>
+
+    <p class="mb-4 leading-relaxed">
+      With all the fixes merged, the current LFortran main branch now compiles <code>benchmark.f</code> to
+      <strong>100%</strong> for both <code>fpm build</code> and <code>fpm test</code>, and the full test suite passes
+      with <strong>18/18 tests</strong>. Here is the proof:
+    </p>
+
+    <pre
+      class="bg-gray-100 text-gray-800 p-4 rounded-md overflow-x-auto max-h-96 overflow-y-auto text-xs sm:text-sm font-mono mt-2 mb-6"><code>(lf) root@LAPTOP-8SLTQKJO:~/benchmark.f# time fpm build --compiler=lfortran --flag "--cpp --realloc-lhs-arrays --use-loop-variable-after-loop --no-style-suggestions --separate-compilation"
+ + mkdir -p build/dependencies
+OutputUnit.f90                         done.
+ArgumentBase.f90                       done.
+Workflow.f90                           done.
+Kinds.f90                              done.
+Version.f90                            done.
+rhofunc.f90                            done.
+EquationConstants.f90                  done.
+precmod.f90                            done.
+FEQParse_FloatStacks.F90               done.
+FEQParse_TokenStack.F90                done.
+FEQParse_Functions.F90                 done.
+error_module.f90                       done.
+params.f90                             done.
+FortranParser_parameters.f90           done.
+fparser.f90                            done.
+precision.f90                          done.
+M_Calculator.f90                       done.
+SystemInfo.f90                         done.
+Warning.f90                            done.
+Options.f90                            done.
+String.f90                             done.
+SteadyStateDetection.f90               done.
+Timer.f90                              done.
+Statistics.f90                         done.
+AllocataionLibrary.f90                 done.
+Parameters.f90                         done.
+equationparser.f90                     done.
+stringmod.f90                          done.
+FEQParse.F90                           done.
+function_parser.f90                    done.
+extrafunc.f90                          done.
+fortranparser.f90                      done.
+fee.f90                                done.
+Argument.f90                           done.
+System.f90                             done.
+Setup.f90                              done.
+Compiler.f90                           done.
+Utility.f90                            done.
+Abstract.f90                           done.
+evalmod.f90                            done.
+interpreter.f90                        done.
+Method.f90                             done.
+Runner6.f90                            done.
+Runner9.f90                            done.
+Runner2.f90                            done.
+Runner3.f90                            done.
+Runner8.f90                            done.
+Runner1.f90                            done.
+Runner5.f90                            done.
+Runner4.f90                            done.
+References.f90                         done.
+Runner7.f90                            done.
+Run.f90                                done.
+DryRun.f90                             done.
+Factory.f90                            done.
+Steps.f90                              done.
+Runner.f90                             done.
+Benchmark.f90                          done.
+libbenchmark.a                         done.
+Simple.f90                             done.
+Poisson.f90                            done.
+Allocation.f90                         done.
+UpperCasing.f90                        done.
+Parsers.f90                            done.
+simple                                 done.
+poisson                                done.
+allocation                             done.
+uppercasing                            done.
+parsers                                done.
+[100%] Project compiled successfully.
+
+real    0m52.187s
+user    0m48.975s
+sys     0m1.156s
+
+(lf) root@LAPTOP-8SLTQKJO:~/benchmark.f# fpm test --compiler=lfortran --flag "--cpp --realloc-lhs-arrays --use-loop-variable-after-loop --no-style-suggestions --separate-compilation"
+ + mkdir -p build/dependencies
+OutputUnit.f90                         done.
+ArgumentBase.f90                       done.
+Workflow.f90                           done.
+Kinds.f90                              done.
+Version.f90                            done.
+rhofunc.f90                            done.
+EquationConstants.f90                  done.
+precmod.f90                            done.
+FEQParse_FloatStacks.F90               done.
+FEQParse_TokenStack.F90                done.
+FEQParse_Functions.F90                 done.
+error_module.f90                       done.
+params.f90                             done.
+FortranParser_parameters.f90           done.
+fparser.f90                            done.
+precision.f90                          done.
+M_Calculator.f90                       done.
+SystemInfo.f90                         done.
+Warning.f90                            done.
+Options.f90                            done.
+String.f90                             done.
+SteadyStateDetection.f90               done.
+Timer.f90                              done.
+Statistics.f90                         done.
+AllocataionLibrary.f90                 done.
+Parameters.f90                         done.
+Utility.f90                            done.
+equationparser.f90                     done.
+stringmod.f90                          done.
+FEQParse.F90                           done.
+function_parser.f90                    done.
+extrafunc.f90                          done.
+fortranparser.f90                      done.
+fee.f90                                done.
+Argument.f90                           done.
+System.f90                             done.
+Setup.f90                              done.
+Compiler.f90                           done.
+Utility.f90                            done.
+Abstract.f90                           done.
+evalmod.f90                            done.
+interpreter.f90                        done.
+Method.f90                             done.
+Runner6.f90                            done.
+Runner9.f90                            done.
+Runner2.f90                            done.
+Runner3.f90                            done.
+Runner8.f90                            done.
+Runner1.f90                            done.
+Runner5.f90                            done.
+Runner4.f90                            done.
+References.f90                         done.
+Runner7.f90                            done.
+Run.f90                                done.
+DryRun.f90                             done.
+Factory.f90                            done.
+Steps.f90                              done.
+Runner.f90                             done.
+Benchmark.f90                          done.
+libbenchmark.a                         done.
+Simple.f90                             done.
+Poisson.f90                            done.
+Allocation.f90                         done.
+UpperCasing.f90                        done.
+Parsers.f90                            done.
+main.f90                               done.
+simple                                 done.
+poisson                                done.
+allocation                             done.
+uppercasing                            done.
+parsers                                done.
+test                                   done.
+[100%] Project compiled successfully.
+[==========] Running test cases from tests/main.f90
+[----------] Test test_arguments
+[ RUN      ] test_arguments. EXPECT_STREQ at line   2
+[       OK ] test_arguments. EXPECT_STREQ line   1 ( 0.200E-03 ms)
+[ RUN      ] test_arguments. EXPECT_STREQ at line   2
+[       OK ] test_arguments. EXPECT_STREQ line   1 ( 0.400E-04 ms)
+[ RUN      ] test_arguments. EXPECT_TRUE at line   1
+[       OK ] test_arguments. EXPECT_TRUE line   1 ( 0.270E-04 ms)
+[ RUN      ] test_arguments. EXPECT_STREQ at line   2
+[       OK ] test_arguments. EXPECT_STREQ line   1 ( 0.410E-04 ms)
+[----------] Ran   4 tests from test_arguments
+[  PASSED  ]   4 tests from test_arguments ( 0.115E-02 ms total)
+[----------] Test test_string
+[ RUN      ] test_string. EXPECT_STREQ at line   2
+[       OK ] test_string. EXPECT_STREQ line   1 ( 0.250E-04 ms)
+[ RUN      ] test_string. EXPECT_STREQ at line   2
+[       OK ] test_string. EXPECT_STREQ line   1 ( 0.320E-04 ms)
+[ RUN      ] test_string. EXPECT_STREQ at line   2
+[       OK ] test_string. EXPECT_STREQ line   1 ( 0.900E-05 ms)
+[ RUN      ] test_string. EXPECT_STREQ at line   2
+[       OK ] test_string. EXPECT_STREQ line   1 ( 0.800E-05 ms)
+[----------] Ran   4 tests from test_string
+[  PASSED  ]   4 tests from test_string ( 0.243E-03 ms total)
+[----------] Test test_serialization
+[ RUN      ] test_serialization. EXPECT_TRUE at line   1
+[       OK ] test_serialization. EXPECT_TRUE line   1 ( 0.560E-04 ms)
+[ RUN      ] test_serialization. EXPECT_EQ at line   1
+[       OK ] test_serialization. EXPECT_EQ line   1 ( 0.440E-04 ms)
+[ RUN      ] test_serialization. EXPECT_EQ at line   1
+[       OK ] test_serialization. EXPECT_EQ line   1 ( 0.280E-04 ms)
+[ RUN      ] test_serialization. EXPECT_EQ at line   1
+[       OK ] test_serialization. EXPECT_EQ line   1 ( 0.290E-04 ms)
+[ RUN      ] test_serialization. EXPECT_EQ at line   1
+[       OK ] test_serialization. EXPECT_EQ line   1 ( 0.250E-04 ms)
+[ RUN      ] test_serialization. EXPECT_EQ at line   1
+[       OK ] test_serialization. EXPECT_EQ line   1 ( 0.300E-04 ms)
+[ RUN      ] test_serialization. EXPECT_EQ at line   1
+[       OK ] test_serialization. EXPECT_EQ line   1 ( 0.520E-04 ms)
+[----------] Ran   7 tests from test_serialization
+[  PASSED  ]   7 tests from test_serialization ( 0.145E-02 ms total)
+[----------] Test test_calling
+[ RUN      ] test_calling. EXPECT_TRUE at line   1
+[       OK ] test_calling. EXPECT_TRUE line   1 ( 0.560E-04 ms)
+[ RUN      ] test_calling. EXPECT_TRUE at line   1
+[       OK ] test_calling. EXPECT_TRUE line   1 ( 0.360E-04 ms)
+[----------] Ran   2 tests from test_calling
+[  PASSED  ]   2 tests from test_calling ( 0.533E-03 ms total)
+
+
+                                  &lt;!&gt;     WARNING     &lt;!&gt;
+                           Maximum number of calls reached for some cases. Steady state may not have been reached for all runs.
+[----------] Test test_methods
+[ RUN      ] test_methods. EXPECT_TRUE at line   1
+[       OK ] test_methods. EXPECT_TRUE line   1 ( 0.121E-03 ms)
+[----------] Ran   1 tests from test_methods
+[  PASSED  ]   1 tests from test_methods ( 0.192E-03 ms total)
+[==========] Ran  18 tests from tests/main.f90
+[  PASSED  ]  18 tests from tests/main.f90
+(lf) root@LAPTOP-8SLTQKJO:~/benchmark.f#</code></pre>
+
+
+
+    <p class="mb-8 mt-6 leading-relaxed bg-blue-50 border-l-4 border-blue-500 p-4 text-blue-800 rounded">
+      <strong>Time Log:</strong> I worked around 35 hours this week, debugging namelist I/O and the preprocessor,
+      creating minimal reproducers for the upstream benchmark.f bugs, and verifying the full build and test pipeline.
+    </p>
+
+    <!-- ===== Acknowledgments ===== -->
+    <h3 class="text-xl font-semibold mt-8 mb-2">Acknowledgments</h3>
+    <p class="mb-4 leading-relaxed">
+      I would like to thank <a href="https://github.com/assem2002" target="_blank"
+        class="text-blue-600 hover:underline">Assem Medhat</a>, <a href="https://github.com/HarshitaKalani"
+        target="_blank" class="text-blue-600 hover:underline">Harshita Kalani</a>, and <a
+        href="https://github.com/HarshilShah1804" target="_blank" class="text-blue-600 hover:underline">Harshil
+        Shah</a> for the detailed code reviews and
+      discussions, and <a href="https://github.com/certik" target="_blank"
+        class="text-blue-600 hover:underline">Ondřej Čertík</a> for his continuous support on the project. A special
+      thanks to <a href="https://github.com/davidpfister" target="_blank"
+        class="text-blue-600 hover:underline">David Pfister</a>, the author of <code>benchmark.f</code>, for the quick
+      responses and for promptly fixing the reported bugs upstream.
+    </p>
+
+  </section>
+
+  <!-- Navigation -->
+  <section class="px-6 max-w-4xl mx-auto flex justify-between py-6 border-t">
+    <a href="week9.html" class="text-blue-600 hover:underline font-medium">← Previous Week</a>
+    <a href="gsoc26.html" class="text-blue-600 hover:underline font-medium">Blog Home</a>
+  </section>
+
+  <!-- Footer -->
+  <footer class="bg-gray-100 text-center py-8 text-sm text-gray-600">
+    <div class="flex justify-center space-x-6 mb-2 text-gray-700 text-xl">
+      <a href="https://github.com/Jatinagarwal24" target="_blank"><i class="fab fa-github hover:text-gray-900"></i></a>
+      <a href="mailto:23110147@iitgn.ac.in"><i class="fas fa-envelope hover:text-gray-900"></i></a>
+    </div>
+    <p>Thanks for reading and for following along this summer. ❤️</p>
+  </footer>
+
+</body>
+
+</html>
